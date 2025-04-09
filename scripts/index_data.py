@@ -116,7 +116,7 @@ def create_index(documents):
         if use_code_splitter:
             try:
                 splitter = CodeSplitter(language=language)
-                chunks = splitter.split(doc.text)
+                chunks = splitter.split_text(doc.text)
             except Exception as e:
                 print(f"⚠️  CodeSplitter failed for {file_name}, falling back to SentenceSplitter: {e}")
                 splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
@@ -131,7 +131,10 @@ def create_index(documents):
                 Document(text=chunk, metadata={"file_name": file_name, "file_path": trimmed_file_path, "chunk": i, "language": language})
             )
 
+    print(f"📝 Creating index with {len(transformed_documents)} chunks...")
     index = VectorStoreIndex.from_documents(transformed_documents, storage_context=storage_context)
+    
+    print("💾 Persisting index...")
     index.storage_context.persist(persist_dir=str(INDEX_DIR))
     print("✅ Indexing complete.")
 

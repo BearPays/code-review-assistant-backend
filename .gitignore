@@ -25,6 +25,7 @@ venv/
 env/
 ENV/
 code_review_env/
+.venv/
 
 # IDE
 .idea/

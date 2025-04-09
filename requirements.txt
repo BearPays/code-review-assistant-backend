@@ -10,5 +10,6 @@ typing-extensions>=4.11.0,<5.0.0
 transformers>=4.0.0,<5.0.0
 llama-index-llms-ollama
 llama-index-embeddings-huggingface
-tree_sitter
-tree_sitter_languages
+tree-sitter==0.20.4
+tree-sitter-languages==1.7.0
+pybind11==2.11.1

@@ -24,6 +24,7 @@ wheels/
 venv/
 env/
 ENV/
+code_review_env/
 
 # IDE
 .idea/
@@ -62,4 +63,7 @@ htmlcov/
 .tox/
 .coverage.*
 coverage.xml
-*.cover 
+*.cover
+
+# Data folder
+data/

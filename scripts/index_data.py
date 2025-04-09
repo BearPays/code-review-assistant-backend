@@ -6,111 +6,150 @@ This creates a persisted index that can be loaded by the FastAPI application.
 
 import os
 import sys
+import shutil
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
-from llama_index.core import VectorStoreIndex, Settings, SimpleDirectoryReader
+from typing import List
+
+import chromadb
+from llama_index.core import (
+    VectorStoreIndex, SimpleDirectoryReader, Settings
+)
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.storage.storage_context import StorageContext
-from llama_index.core.node_parser import SentenceSplitter
-import chromadb
+from llama_index.core.node_parser import SentenceSplitter, CodeSplitter
+from llama_index.core.schema import Document
 from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.embeddings.openai import OpenAIEmbedding
 
-# Load environment variables
+# === Constants and Configuration ===
 load_dotenv()
 
-# Constants
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-INDEX_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "indexes")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+INDEX_DIR = PROJECT_ROOT / "indexes"
+COLLECTION_NAME = "rag_collection"
 
-# Code file extensions to include
-CODE_EXTENSIONS = [
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cpp", ".c", ".h", 
-    ".cs", ".php", ".rb", ".go", ".swift", ".kt", ".rs", ".scala", ".sh",
-    ".html", ".css", ".sql", ".json", ".yaml", ".yml", ".md", ".txt"
-]
+CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cpp", ".c", ".h", ".cs",
+    ".php", ".rb", ".go", ".swift", ".kt", ".rs", ".scala", ".sh",
+    ".html", ".css", ".json", ".yaml", ".yml"
+}
 
-# Directories to exclude
-EXCLUDE_DIRS = ["node_modules", "__pycache__", "venv", ".git", ".idea", ".vscode", "dist", "build"]
+TEXT_EXTENSIONS = {".txt", ".md"}
 
-def main():
-    """Main function to index documents."""
-    # Check if OpenAI API key is available
-    if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "your_openai_api_key_here":
-        print("Error: OPENAI_API_KEY not found in environment variables or is set to the default value.")
-        print("Please set it in your .env file or export it.")
-        sys.exit(1)
+EXCLUDE_DIRS = {"node_modules", "__pycache__", "venv", ".git", ".idea", ".vscode", "dist", "build"}
 
-    print(f"Using OpenAI API key: {os.getenv('OPENAI_API_KEY')[:5]}...")
-    
-    # Configure LlamaIndex settings
-    Settings.llm = OpenAI(model="gpt-4")
-    
-    # Create a text splitter for code and text files
-    text_splitter = SentenceSplitter(
-        chunk_size=1024,
-        chunk_overlap=200
-    )
-    
-    print(f"Loading documents from {DATA_DIR}...")
-    try:
-        # Find all files in the data directory that match our criteria
-        all_files = []
-        for ext in CODE_EXTENSIONS:
-            for file_path in Path(DATA_DIR).glob(f"**/*{ext}"):
-                # Check if the file is in an excluded directory
-                path_str = str(file_path)
-                if not any(excluded_dir in path_str for excluded_dir in EXCLUDE_DIRS):
-                    all_files.append(str(file_path))
-        
-        print(f"Found {len(all_files)} files matching criteria.")
-        
-        # Use SimpleDirectoryReader with explicit file paths
-        documents = SimpleDirectoryReader(
-            input_files=all_files,
-            recursive=True,
-            exclude_hidden=True
-        ).load_data()
-        
-        print(f"Loaded {len(documents)} documents.")
-        
-        if not documents:
-            print("No code files found. Please add code files to the data/ directory.")
+DEFAULT_HF_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
+DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+USE_HF_EMBEDDING = os.getenv("USE_HF_EMBEDDING", "false").lower() == "true"
+FORCE_REINDEX = os.getenv("FORCE_REINDEX", "false").lower() == "true"
+
+SUPPORTED_CODE_LANGUAGES = {
+    "c", "cpp", "csharp", "go", "html", "java", "javascript",
+    "python", "ruby", "rust", "bash"
+}
+
+EXTENSION_TO_LANGUAGE = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript", ".jsx": "javascript",
+    ".tsx": "typescript", ".java": "java", ".cpp": "cpp", ".c": "c", ".h": "c",
+    ".cs": "csharp", ".php": "php", ".rb": "ruby", ".go": "go", ".swift": "swift",
+    ".kt": "kotlin", ".rs": "rust", ".scala": "scala", ".sh": "bash",
+    ".html": "html", ".css": "css", ".sql": "sql", ".json": "json",
+    ".yaml": "yaml", ".yml": "yaml"
+}
+
+# === Helper Functions ===
+def validate_env():
+    if not USE_HF_EMBEDDING:
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key or openai_key == "your_openai_api_key_here":
+            print("\n❌ OPENAI_API_KEY is missing or set to placeholder.")
             sys.exit(1)
-    except Exception as e:
-        print(f"Error loading documents: {e}")
-        sys.exit(1)
-    
-    print("Creating ChromaDB client and collection...")
-    
-    # Clean up old index directory if it exists
-    if os.path.exists(INDEX_DIR):
-        import shutil
-        print(f"Removing existing index directory at {INDEX_DIR}")
+
+def configure_settings():
+    if USE_HF_EMBEDDING:
+        print("🔧 Using Hugging Face embedding model...")
+        Settings.embed_model = HuggingFaceEmbedding(model_name=DEFAULT_HF_EMBEDDING_MODEL)
+    else:
+        print("🔧 Using OpenAI embedding model...")
+        Settings.embed_model = OpenAIEmbedding(model=DEFAULT_OPENAI_EMBEDDING_MODEL)
+
+def get_all_files(data_dir: Path) -> List[str]:
+    file_paths = []
+    for root, dirs, files in os.walk(data_dir):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for file in files:
+            if Path(file).suffix in CODE_EXTENSIONS or Path(file).suffix in TEXT_EXTENSIONS:
+                file_paths.append(os.path.join(root, file))
+    return file_paths
+
+def load_documents(file_paths: List[str]):
+    print(f"📥 Loading {len(file_paths)} files...")
+    reader = SimpleDirectoryReader(input_files=file_paths, recursive=True, exclude_hidden=True)
+    return reader.load_data()
+
+def create_index(documents):
+    if FORCE_REINDEX and INDEX_DIR.exists():
+        print(f"🗑️  Removing old index at {INDEX_DIR}")
         shutil.rmtree(INDEX_DIR)
-    
-    # Create the chroma client and collection
-    chroma_client = chromadb.PersistentClient(path=INDEX_DIR)
-    chroma_collection = chroma_client.create_collection("rag_collection")
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+
+    print("⚙️  Initializing ChromaDB...")
+    chroma_client = chromadb.PersistentClient(path=str(INDEX_DIR))
+    collection = chroma_client.create_collection(COLLECTION_NAME)
+    vector_store = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    
-    print("Creating index...")
+
+    print("📐 Splitting documents and creating index...")
+
+    transformed_documents = []
+    for doc in documents:
+        file_name = doc.metadata.get('file_name', '')
+        file_extension = Path(file_name).suffix
+        file_path = doc.metadata.get('file_path', '')
+        language = EXTENSION_TO_LANGUAGE.get(file_extension)
+
+        use_code_splitter = language in SUPPORTED_CODE_LANGUAGES if language else False
+
+        if use_code_splitter:
+            try:
+                splitter = CodeSplitter(language=language)
+                chunks = splitter.split(doc.text)
+            except Exception as e:
+                print(f"⚠️  CodeSplitter failed for {file_name}, falling back to SentenceSplitter: {e}")
+                splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
+                chunks = splitter.split_text(doc.text)
+        else:
+            splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
+            chunks = splitter.split_text(doc.text)
+
+        for i, chunk in enumerate(chunks):
+            trimmed_file_path = str(Path(file_path).relative_to(DATA_DIR))
+            transformed_documents.append(
+                Document(text=chunk, metadata={"file_name": file_name, "file_path": trimmed_file_path, "chunk": i, "language": language})
+            )
+
+    index = VectorStoreIndex.from_documents(transformed_documents, storage_context=storage_context)
+    index.storage_context.persist(persist_dir=str(INDEX_DIR))
+    print("✅ Indexing complete.")
+
+# === Entry Point ===
+def main():
     try:
-        # Use the text splitter for chunking
-        index = VectorStoreIndex.from_documents(
-            documents, 
-            storage_context=storage_context,
-            transformations=[text_splitter]
-        )
-        
-        # Persist index
-        print(f"Persisting index to {INDEX_DIR}...")
-        index.storage_context.persist(persist_dir=INDEX_DIR)
-        
-        print("Indexing completed successfully.")
+        validate_env()
+        configure_settings()
+        file_paths = get_all_files(DATA_DIR)
+        if not file_paths:
+            print("⚠️  No files found to index.")
+            return
+        documents = load_documents(file_paths)
+        create_index(documents)
     except Exception as e:
-        print(f"Error creating index: {e}")
+        print(f"❌ Unexpected error: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

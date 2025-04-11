@@ -20,6 +20,8 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.storage.storage_context import StorageContext
 from llama_index.core.node_parser import SentenceSplitter, CodeSplitter
 from llama_index.core.schema import Document
+from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.core.storage.index_store import SimpleIndexStore
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -96,8 +98,101 @@ def get_all_projects(data_dir: Path) -> List[Path]:
     """Get all subfolders in the data directory."""
     return [f for f in data_dir.iterdir() if f.is_dir()]
 
+def get_project_subfolders(project_dir: Path) -> List[Path]:
+    """Get all subfolders within a project directory."""
+    return [f for f in project_dir.iterdir() if f.is_dir() and f.name not in EXCLUDE_DIRS]
+
+def create_collection_name(project_name: str, subfolder_name: str) -> str:
+    """Create a unique collection name for a subfolder within a project."""
+    return f"{project_name}_{subfolder_name}"
+
+def create_collection_index(project_dir: Path, subfolder: Path, chroma_client: chromadb.PersistentClient, project_name: str):
+    """Create an index for a specific subfolder within a project."""
+    subfolder_name = subfolder.name
+    collection_name = create_collection_name(project_name, subfolder_name)
+    
+    print(f"  ⚙️  Creating collection '{collection_name}'...")
+    try:
+        collection = chroma_client.get_collection(collection_name)
+        if FORCE_REINDEX:
+            print(f"  🗑️  Removing old collection '{collection_name}'")
+            chroma_client.delete_collection(collection_name)
+            collection = chroma_client.create_collection(collection_name)
+    except Exception:
+        collection = chroma_client.create_collection(collection_name)
+    
+    vector_store = ChromaVectorStore(chroma_collection=collection)
+    
+    # Create a storage directory for this collection
+    collection_storage_dir = INDEX_DIR / project_name / f"storage_{subfolder_name}"
+    
+    # Ensure the directory exists and is empty
+    if collection_storage_dir.exists():
+        shutil.rmtree(collection_storage_dir)
+    collection_storage_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create a new storage context without trying to load existing files
+    storage_context = StorageContext.from_defaults(
+        vector_store=vector_store,
+        docstore=SimpleDocumentStore(),
+        index_store=SimpleIndexStore(),
+        persist_dir=str(collection_storage_dir)
+    )
+
+    print(f"  📥 Loading files for collection '{collection_name}'...")
+    file_paths = get_all_files(subfolder)
+    if not file_paths:
+        print(f"  ⚠️  No files found in collection '{collection_name}'. Skipping...")
+        return
+
+    documents = load_documents(file_paths)
+
+    print(f"  📐 Splitting documents for collection '{collection_name}'...")
+    transformed_documents = []
+    for doc in documents:
+        file_name = doc.metadata.get('file_name', '')
+        file_extension = Path(file_name).suffix
+        file_path = doc.metadata.get('file_path', '')
+        language = EXTENSION_TO_LANGUAGE.get(file_extension)
+
+        use_code_splitter = file_extension in CODE_EXTENSIONS if file_extension else False
+
+        if use_code_splitter:
+            try:
+                splitter = CodeSplitter(language=language)
+                chunks = splitter.split_text(doc.text)
+            except Exception as e:
+                print(f"  ⚠️  CodeSplitter failed for {file_name}, falling back to SentenceSplitter: {e}")
+                splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
+                chunks = splitter.split_text(doc.text)
+        else:
+            splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
+            chunks = splitter.split_text(doc.text)
+
+        for i, chunk in enumerate(chunks):
+            trimmed_file_path = str(Path(file_path).relative_to(subfolder))
+            transformed_documents.append(
+                Document(
+                    text=chunk,
+                    metadata={
+                        "file_name": file_name,
+                        "file_path": trimmed_file_path,
+                        "chunk": i,
+                        "language": language,
+                        "collection": collection_name,
+                        "project": project_name
+                    }
+                )
+            )
+
+    print(f"  📝 Creating index with {len(transformed_documents)} chunks for collection '{collection_name}'...")
+    index = VectorStoreIndex.from_documents(transformed_documents, storage_context=storage_context)
+
+    print(f"  💾 Persisting index for collection '{collection_name}'...")
+    index.storage_context.persist(persist_dir=str(collection_storage_dir))
+
 def create_project_index(project_dir: Path):
-    """Create an index for a specific project."""
+    """Create an index for a specific project and its subfolders."""
     project_name = project_dir.name
     project_index_dir = INDEX_DIR / project_name
 
@@ -111,53 +206,18 @@ def create_project_index(project_dir: Path):
 
     print(f"⚙️  Initializing ChromaDB for project '{project_name}'...")
     chroma_client = chromadb.PersistentClient(path=str(project_index_dir))
-    collection = chroma_client.create_collection(COLLECTION_NAME)
-    vector_store = ChromaVectorStore(chroma_collection=collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    print(f"📥 Loading files for project '{project_name}'...")
-    file_paths = get_all_files(project_dir)
-    if not file_paths:
-        print(f"⚠️  No files found in project '{project_name}'. Skipping...")
+    # Get all subfolders in the project
+    subfolders = get_project_subfolders(project_dir)
+    if not subfolders:
+        print(f"⚠️  No subfolders found in project '{project_name}'. Skipping...")
         return
 
-    documents = load_documents(file_paths)
+    # Create collections for each subfolder
+    for subfolder in subfolders:
+        create_collection_index(project_dir, subfolder, chroma_client, project_name)
 
-    print(f"📐 Splitting documents and creating index for project '{project_name}'...")
-    transformed_documents = []
-    for doc in documents:
-        file_name = doc.metadata.get('file_name', '')
-        file_extension = Path(file_name).suffix
-        file_path = doc.metadata.get('file_path', '')
-        language = EXTENSION_TO_LANGUAGE.get(file_extension)
-
-        # use_code_splitter = language in SUPPORTED_CODE_LANGUAGES if language else False
-        use_code_splitter = file_extension in CODE_EXTENSIONS if file_extension else False
-
-        if use_code_splitter:
-            try:
-                splitter = CodeSplitter(language=language)
-                chunks = splitter.split_text(doc.text)
-            except Exception as e:
-                print(f"⚠️  CodeSplitter failed for {file_name}, falling back to SentenceSplitter: {e}")
-                splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
-                chunks = splitter.split_text(doc.text)
-        else:
-            splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
-            chunks = splitter.split_text(doc.text)
-
-        for i, chunk in enumerate(chunks):
-            trimmed_file_path = str(Path(file_path).relative_to(project_dir))
-            transformed_documents.append(
-                Document(text=chunk, metadata={"file_name": file_name, "file_path": trimmed_file_path, "chunk": i, "language": language})
-            )
-
-    print(f"📝 Creating index with {len(transformed_documents)} chunks for project '{project_name}'...")
-    index = VectorStoreIndex.from_documents(transformed_documents, storage_context=storage_context)
-
-    print(f"💾 Persisting index for project '{project_name}'...")
-    index.storage_context.persist(persist_dir=str(project_index_dir))
-    print(f"✅ Indexing complete for project '{project_name}'.")
+    print(f"✅ Project '{project_name}' indexing complete!")
 
 # === Updated Entry Point ===
 def main():

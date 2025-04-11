@@ -91,19 +91,39 @@ def load_documents(file_paths: List[str]):
     reader = SimpleDirectoryReader(input_files=file_paths, recursive=True, exclude_hidden=True)
     return reader.load_data()
 
-def create_index(documents):
-    if FORCE_REINDEX and INDEX_DIR.exists():
-        print(f"🗑️  Removing old index at {INDEX_DIR}")
-        shutil.rmtree(INDEX_DIR)
+# === Updated Helper Functions ===
+def get_all_projects(data_dir: Path) -> List[Path]:
+    """Get all subfolders in the data directory."""
+    return [f for f in data_dir.iterdir() if f.is_dir()]
 
-    print("⚙️  Initializing ChromaDB...")
-    chroma_client = chromadb.PersistentClient(path=str(INDEX_DIR))
+def create_project_index(project_dir: Path):
+    """Create an index for a specific project."""
+    project_name = project_dir.name
+    project_index_dir = INDEX_DIR / project_name
+
+    if project_index_dir.exists() and not FORCE_REINDEX:
+        print(f"✅ Index for project '{project_name}' already exists. Skipping...")
+        return
+
+    if project_index_dir.exists():
+        print(f"🗑️  Removing old index for project '{project_name}'")
+        shutil.rmtree(project_index_dir)
+
+    print(f"⚙️  Initializing ChromaDB for project '{project_name}'...")
+    chroma_client = chromadb.PersistentClient(path=str(project_index_dir))
     collection = chroma_client.create_collection(COLLECTION_NAME)
     vector_store = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    print("📐 Splitting documents and creating index...")
+    print(f"📥 Loading files for project '{project_name}'...")
+    file_paths = get_all_files(project_dir)
+    if not file_paths:
+        print(f"⚠️  No files found in project '{project_name}'. Skipping...")
+        return
 
+    documents = load_documents(file_paths)
+
+    print(f"📐 Splitting documents and creating index for project '{project_name}'...")
     transformed_documents = []
     for doc in documents:
         file_name = doc.metadata.get('file_name', '')
@@ -127,29 +147,30 @@ def create_index(documents):
             chunks = splitter.split_text(doc.text)
 
         for i, chunk in enumerate(chunks):
-            trimmed_file_path = str(Path(file_path).relative_to(DATA_DIR))
+            trimmed_file_path = str(Path(file_path).relative_to(project_dir))
             transformed_documents.append(
                 Document(text=chunk, metadata={"file_name": file_name, "file_path": trimmed_file_path, "chunk": i, "language": language})
             )
 
-    print(f"📝 Creating index with {len(transformed_documents)} chunks...")
+    print(f"📝 Creating index with {len(transformed_documents)} chunks for project '{project_name}'...")
     index = VectorStoreIndex.from_documents(transformed_documents, storage_context=storage_context)
-    
-    print("💾 Persisting index...")
-    index.storage_context.persist(persist_dir=str(INDEX_DIR))
-    print("✅ Indexing complete.")
 
-# === Entry Point ===
+    print(f"💾 Persisting index for project '{project_name}'...")
+    index.storage_context.persist(persist_dir=str(project_index_dir))
+    print(f"✅ Indexing complete for project '{project_name}'.")
+
+# === Updated Entry Point ===
 def main():
     try:
         validate_env()
         configure_settings()
-        file_paths = get_all_files(DATA_DIR)
-        if not file_paths:
-            print("⚠️  No files found to index.")
+        projects = get_all_projects(DATA_DIR)
+        if not projects:
+            print("⚠️  No projects found in the data directory.")
             return
-        documents = load_documents(file_paths)
-        create_index(documents)
+
+        for project in projects:
+            create_project_index(project)
     except Exception as e:
         print(f"❌ Unexpected error: {e}")
         traceback.print_exc()

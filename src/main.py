@@ -25,32 +25,38 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Load the persisted index
+# === Updated Constants ===
+PROJECT_NAME = ""  # Specify the project name to load its index (subfolder in the indexes directory)
+
+# === Updated Index Loading ===
 try:
-    # Get absolute path to indexes directory
+    if not PROJECT_NAME:
+        raise ValueError("PROJECT_NAME is not set. Please specify a project to load.")
+
+    # Get absolute path to the specific project's index directory
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
-    index_dir = os.path.join(project_root, "indexes")
-    
-    print(f"Loading index from {index_dir}")
-    
+    project_index_dir = os.path.join(project_root, "indexes", PROJECT_NAME)
+
+    print(f"Loading index for project '{PROJECT_NAME}' from {project_index_dir}")
+
     # Connect to the Chroma collection
-    chroma_client = chromadb.PersistentClient(path=index_dir)
+    chroma_client = chromadb.PersistentClient(path=project_index_dir)
     chroma_collection = chroma_client.get_collection("rag_collection")
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    
+
     # Load the index using the vector store
-    storage_context = StorageContext.from_defaults(vector_store=vector_store, persist_dir=index_dir)
+    storage_context = StorageContext.from_defaults(vector_store=vector_store, persist_dir=project_index_dir)
     index = load_index_from_storage(storage_context)
-    
+
     # Create retriever and query engine
     retriever = index.as_retriever(similarity_top_k=3)
     query_engine = index.as_query_engine(llm=OpenAI(model="gpt-4"))
-    
-    print("Index loaded successfully!")
+
+    print(f"Index for project '{PROJECT_NAME}' loaded successfully!")
 except Exception as e:
-    print(f"Error loading index: {e}")
-    print("Ensure you've run the indexing script first: python scripts/index_data.py")
+    print(f"Error loading index for project '{PROJECT_NAME}': {e}")
+    print("Ensure you've run the indexing script first and specified a valid project name.")
     index = None
     query_engine = None
 
@@ -96,4 +102,4 @@ def query_index(request: QueryRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

@@ -111,7 +111,8 @@ def create_index(documents):
         file_path = doc.metadata.get('file_path', '')
         language = EXTENSION_TO_LANGUAGE.get(file_extension)
 
-        use_code_splitter = language in SUPPORTED_CODE_LANGUAGES if language else False
+        # use_code_splitter = language in SUPPORTED_CODE_LANGUAGES if language else False
+        use_code_splitter = file_extension in CODE_EXTENSIONS if file_extension else False
 
         if use_code_splitter:
             try:

@@ -9,8 +9,9 @@ from llama_index.core import StorageContext, load_index_from_storage
 from llama_index.llms.openai import OpenAI
 from llama_index.vector_stores.chroma import ChromaVectorStore
 import chromadb
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Literal
 import json
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -33,16 +34,98 @@ PROJECT_NAME = "project_2"  # Specify the project name to load its index (subfol
 # === Updated Index Loading ===
 query_engines: Dict[str, Dict] = {}  # Store query engines for each collection
 
-def get_collection_plan(query: str) -> Dict:
-    """Have the LLM analyze the query and determine which collections to query and in what order."""
-    available_collections = list(query_engines.keys())
+# === In-Memory Session Storage ===
+sessions: Dict[str, Dict] = {}
+
+# === Session Data Model ===
+class SessionData(BaseModel):
+    pr_id: str
+    mode: Literal["co_reviewer", "interactive_assistant"]
+    chat_history: List[Dict] = []
+    initial_review_generated: bool = False
+    query_engines: Dict = {}
+    collections: List[str] = []
+
+# Function to load index for a specific project
+def load_project_index(pr_id: str) -> Dict:
+    """Loads the index and query engines for a given project ID."""
+    query_engines_for_pr = {}
+    collections_for_pr = []
+    try:
+        # Get absolute path to the specific project's index directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        project_index_dir = os.path.join(project_root, "indexes", pr_id)
+
+        if not os.path.isdir(project_index_dir):
+            raise FileNotFoundError(f"Index directory not found for project: {pr_id}")
+
+        print(f"Loading index for project '{pr_id}' from {project_index_dir}")
+
+        # Connect to ChromaDB
+        chroma_client = chromadb.PersistentClient(path=project_index_dir)
+        
+        # Get all collections for this project
+        db_collections = chroma_client.list_collections()
+        print(f"Found collections in DB: {[col.name for col in db_collections]}")
+
+        # Create query engines for each collection
+        for collection in db_collections:
+            collection_name = collection.name
+            collections_for_pr.append(collection_name)
+            print(f"Loading collection '{collection_name}'...")
+            
+            try:
+                # Get the collection
+                chroma_collection = chroma_client.get_collection(collection_name)
+                vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+                
+                # Derive storage dir name based on common pattern or specific logic if needed
+                # Assuming storage dir is named like 'storage_suffix' where collection is 'project_id_suffix'
+                suffix = collection_name.replace(pr_id + '_', '')
+                storage_dir = os.path.join(project_index_dir, f"storage_{suffix}")
+                
+                # Check if storage directory exists and has required files
+                if not os.path.exists(storage_dir) or not os.path.exists(os.path.join(storage_dir, "docstore.json")):
+                    print(f"⚠️  Storage files missing for collection '{collection_name}' at {storage_dir}, skipping...")
+                    continue
+                    
+                storage_context = StorageContext.from_defaults(vector_store=vector_store, persist_dir=storage_dir)
+                index = load_index_from_storage(storage_context)
+                retriever = index.as_retriever(similarity_top_k=3) # Default top_k
+                query_engine = index.as_query_engine(llm=OpenAI(model="gpt-4"))
+                
+                query_engines_for_pr[collection_name] = {
+                    "engine": query_engine,
+                    "retriever": retriever
+                }
+                print(f"✅ Collection '{collection_name}' loaded successfully!")
+            except Exception as e:
+                print(f"⚠️  Error loading collection '{collection_name}': {e}")
+                continue
+
+        if not query_engines_for_pr:
+            raise ValueError(f"No collections were successfully loaded for project {pr_id}.")
+        else:
+            print(f"✅ Successfully loaded {len(query_engines_for_pr)} collections for {pr_id}: {list(query_engines_for_pr.keys())}")
+        
+        return {"query_engines": query_engines_for_pr, "collections": collections_for_pr}
+
+    except Exception as e:
+        print(f"❌ Error initializing project '{pr_id}': {e}")
+        # Re-raise the exception to be caught by the endpoint
+        raise HTTPException(status_code=500, detail=f"Error loading index for project {pr_id}: {str(e)}")
+
+def get_collection_plan(query: str, available_collections: List[str], pr_id: str) -> Dict:
+    """Have the LLM analyze the query and determine which collections to query."""
+    # Note: Using available_collections passed from the session
     
-    system_prompt = f"""You are a Code Review Assistant with access to these specific collections:
+    system_prompt = f"""You are a Code Review Assistant with access to these specific collections for PR '{pr_id}':
 {', '.join(available_collections)}
 
-You are working with structured pull request (PR) data stored in a RAG index named `project_2_pr_data`.
+You are working with structured pull request (PR) data. Assume the collections contain relevant PR data, code diffs, and requirements based on their names (e.g., {pr_id}_pr_data, {pr_id}_code, {pr_id}_requirements).
 
-Each indexed PR contains fields like:
+Each indexed PR might contain fields like:
 - "pr_number" (int): The pull request number
 - "title" (string): Title of the PR
 - "description" (string): Detailed PR description including references and rationale
@@ -57,20 +140,20 @@ Each indexed PR contains fields like:
   - "diff" (string): Full unified diff format (git-style)
 
 Your task is to analyze the user's query and determine which collections to query.
-IMPORTANT: You MUST ONLY use the exact collection names listed above.
+IMPORTANT: You MUST ONLY use the exact collection names listed in `available_collections`.
 
 Analyze the user's query and determine:
 1. Which collections from the available ones are relevant
-2. In what order they should be queried
+2. In what order they should be queried (optional, can be parallel)
 3. What specific aspects to look for in each collection
 
 For PR-related queries:
-- When asked for files changed in the PR, look for the `files` list and extract `filename` fields
-- For PR summaries, use `title`, `description`, and key changes from `files`
-- For specific file diffs, locate the `files` item with matching `filename` and return the `diff`
+- When asked for files changed in the PR, look for the `files` list and extract `filename` fields (likely in a code or PR data collection).
+- For PR summaries, use `title`, `description`, and key changes from `files` (likely in a PR data collection).
+- For specific file diffs, locate the `files` item with matching `filename` and return the `diff` (likely in a code collection).
 
 Return your analysis as a JSON object with:
-- collections: List of collections to query in order (MUST match exact names from the available collections)
+- collections: List of collections to query (MUST match exact names from the available collections)
 - reasoning: Brief explanation of why each collection is needed
 - search_focus: What to look for in each collection, including specific fields to examine
 """
@@ -85,102 +168,62 @@ Return your analysis as a JSON object with:
         plan = json.loads(str(response))
         
         # Validate that the collections exist
+        valid_collections = []
         for collection in plan.get("collections", []):
-            if collection not in query_engines:
+            if collection in available_collections:
+                valid_collections.append(collection)
+            else:
                 print(f"⚠️  LLM suggested invalid collection '{collection}', removing it")
-                plan["collections"].remove(collection)
         
-        if not plan.get("collections"):
+        if not valid_collections:
             # If no valid collections, use all available ones
             plan["collections"] = available_collections
-            plan["reasoning"] = "Using all available collections as no specific ones were determined"
+            plan["reasoning"] = "Using all available collections as no specific ones were determined or validated"
             plan["search_focus"] = "General information"
+        else:
+            plan["collections"] = valid_collections
             
         return plan
     except json.JSONDecodeError:
-        # If not valid JSON, create a default plan
+        # If not valid JSON, create a default plan using all available collections
         return {
             "collections": available_collections,
-            "reasoning": "Could not parse LLM response, using all collections",
+            "reasoning": "Could not parse LLM response for collection plan, using all available collections",
             "search_focus": "General information"
         }
 
-def query_collection(collection_name: str, query: str, focus: str) -> Dict:
-    """Query a specific collection with focused context."""
-    if collection_name not in query_engines:
+def query_collection(session_query_engines: Dict, collection_name: str, query: str, focus: str) -> Optional[Dict]:
+    """Query a specific collection using the session's query engine."""
+    if collection_name not in session_query_engines:
+        print(f"Error: Collection '{collection_name}' not found in session query engines.")
         return None
         
     try:
         # Add focus to the query for better context
         focused_query = f"{query}\n\nFocus on: {focus}"
         
-        # Let LLM determine the appropriate similarity_top_k
-        llm = OpenAI(model="gpt-4")
-        top_k_prompt = f"""Analyze this query and determine how many relevant chunks to retrieve:
-Query: {focused_query}
-
-Consider:
-1. How specific or broad the query is
-2. How many different aspects need to be covered
-3. Whether it's asking for a list or comprehensive information
-
-Return a JSON object with:
-- similarity_top_k: number between 3 and 20
-- reasoning: brief explanation of your choice
-"""
-        top_k_response = llm.complete(top_k_prompt)
-        try:
-            top_k_decision = json.loads(str(top_k_response))
-            similarity_top_k = min(max(int(top_k_decision.get("similarity_top_k", 3)), 3), 20)
-            print(f"Using similarity_top_k={similarity_top_k} for query: {focused_query}")
-        except:
-            similarity_top_k = 3  # Default if parsing fails
+        # TODO: Consider making top_k dynamic or configurable if needed
+        similarity_top_k = 5 # Increased default
         
-        query_engine = query_engines[collection_name]["engine"]
-        retriever = query_engines[collection_name]["retriever"]
+        query_engine_info = session_query_engines[collection_name]
+        query_engine = query_engine_info["engine"]
+        retriever = query_engine_info["retriever"]
         retriever.similarity_top_k = similarity_top_k
         
-        # First attempt at querying
+        print(f"Querying collection '{collection_name}' with top_k={similarity_top_k}")
         response = query_engine.query(focused_query)
-        
-        # Have LLM verify if it has enough information
-        verification_prompt = f"""You have retrieved {similarity_top_k} chunks and generated this response:
-{str(response)}
-
-Original Query: {focused_query}
-
-Analyze if this response:
-1. Fully answers the query
-2. Contains all necessary information
-3. Has any gaps or missing details
-
-Return a JSON object with:
-- has_enough_info: boolean
-- reasoning: explanation of your assessment
-- missing_info: list of any missing information or gaps
-"""
-        verification_response = llm.complete(verification_prompt)
-        try:
-            verification = json.loads(str(verification_response))
-            if not verification.get("has_enough_info", True):
-                # If not enough info, try with more chunks
-                new_top_k = min(similarity_top_k * 2, 20)
-                if new_top_k > similarity_top_k:
-                    print(f"Increasing similarity_top_k to {new_top_k} to get more information")
-                    retriever.similarity_top_k = new_top_k
-                    response = query_engine.query(focused_query)
-        except:
-            pass  # Continue with original response if verification fails
         
         # Extract sources metadata
         sources = []
         if hasattr(response, "source_nodes"):
             for node in response.source_nodes:
-                if hasattr(node, "metadata") and node.metadata:
-                    sources.append(node.metadata)
-                else:
-                    sources.append({"text": node.text[:100] + "..."})
-        
+                metadata = getattr(node, "metadata", {})
+                text_preview = getattr(node, "text", "")[:100] + "..."
+                source_info = {"text_preview": text_preview}
+                if metadata:
+                    source_info.update(metadata) # Add metadata like filename if available
+                sources.append(source_info)
+
         return {
             "answer": str(response),
             "sources": sources,
@@ -190,41 +233,61 @@ Return a JSON object with:
         print(f"Error querying collection '{collection_name}': {e}")
         return None
 
-def synthesize_responses(query: str, responses: List[Dict]) -> Dict:
-    """Have the LLM synthesize responses from multiple collections into a coherent answer."""
-    system_prompt = """You are a Code Review Assistant. You have gathered information from multiple sources about a code review query.
-Your task is to synthesize this information into a coherent, comprehensive answer.
+def synthesize_responses(query: str, responses: List[Dict], chat_history: List[Dict], mode: str) -> Dict:
+    """Synthesize responses, potentially incorporating chat history."""
+    
+    history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+    
+    # Format the responses for the prompt before defining the system prompt
+    formatted_responses = "\n\n".join([
+        f"From {resp['collection']}:\n{resp['answer']}"
+        for resp in responses if resp # Ensure response is not None
+    ])
+    
+    # Define system_prompt as a regular string with placeholders
+    system_prompt = """You are a Code Review Assistant in '{mode}' mode. 
+Your task is to synthesize this information into a coherent, comprehensive answer based on the provided chat history and new information.
 
-Available information:
-{responses}
+Chat History:
+{history_str}
+
+Available New Information:
+{formatted_responses}
 
 User Query: {query}
 
 Provide a well-structured answer that:
-1. Directly addresses the user's query
-2. Incorporates relevant information from all sources
-3. Highlights any discrepancies or important findings
-4. Provides clear, actionable insights
-"""
-    
-    # Format the responses for the prompt
-    formatted_responses = "\n\n".join([
-        f"From {resp['collection']}:\n{resp['answer']}"
-        for resp in responses
-    ])
+1. Directly addresses the user's query, considering the chat history for context.
+2. Incorporates relevant information from all new sources gathered for this query.
+3. If in 'co_reviewer' mode and this is the initial review (history might be short or just the initial query), provide a structured multi-aspect code review.
+4. If in 'interactive_assistant' mode or a follow-up in 'co_reviewer', provide a conversational response based on the history and new info.
+5. Highlights any discrepancies or important findings.
+6. Provides clear, actionable insights where applicable.
+Synthesized Answer:""" # Added a label for the expected output
     
     llm = OpenAI(model="gpt-4")
-    response = llm.complete(
+    
+    # Format the prompt correctly using the variables
+    final_response = llm.complete(
         system_prompt.format(
-            responses=formatted_responses,
+            mode=mode,
+            history_str=history_str if chat_history else "No history yet.",
+            formatted_responses=formatted_responses if responses else "No new information gathered.",
             query=query
         )
     )
     
+    all_sources = []
+    collections_used = []
+    for resp in responses:
+        if resp:
+            all_sources.extend(resp.get("sources", []))
+            collections_used.append(resp.get("collection"))
+
     return {
-        "answer": str(response),
-        "sources": [source for resp in responses for source in resp["sources"]],
-        "collections_used": [resp["collection"] for resp in responses]
+        "answer": str(final_response),
+        "sources": all_sources,
+        "collections_used": list(set(filter(None, collections_used))) # Unique, non-None collection names
     }
 
 try:
@@ -288,52 +351,137 @@ except Exception as e:
     query_engines = {}
 
 # Define request models
-class QueryRequest(BaseModel):
+class ChatRequest(BaseModel):
     query: str
+    pr_id: str
+    mode: Literal["co_reviewer", "interactive_assistant"]
+    session_id: Optional[str] = None
 
-class QueryResponse(BaseModel):
+class ChatResponse(BaseModel):
+    session_id: str
     answer: str
     sources: list
     collections_used: list
+    mode: str
+    pr_id: str
 
+# === Health Check Endpoint ===
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the RAG API. Use /query endpoint to query the system."}
+    return {"message": "Code Review RAG API is running. Use the /chat endpoint."}
 
-@app.post("/query", response_model=QueryResponse)
-def query_index(request: QueryRequest):
-    if not query_engines:
-        raise HTTPException(status_code=500, detail="No collections loaded. Run the indexing script first.")
-    
+# === Main Chat Endpoint ===
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(request: ChatRequest):
+    session_id = request.session_id
+    pr_id = request.pr_id
+    mode = request.mode
+    user_query = request.query
+
+    # --- Session Handling ---
+    if session_id and session_id in sessions:
+        session = sessions[session_id]
+        # Ensure session matches request (optional, but good practice)
+        if session.pr_id != pr_id or session.mode != mode:
+             raise HTTPException(status_code=400, detail=f"Session ID {session_id} exists but with different pr_id or mode.")
+        print(f"Using existing session: {session_id}")
+    else:
+        # Create new session
+        session_id = str(uuid.uuid4())
+        print(f"Creating new session: {session_id} for PR: {pr_id}, Mode: {mode}")
+        try:
+            # Load index specific to this PR
+            index_data = load_project_index(pr_id)
+            session = SessionData(
+                pr_id=pr_id,
+                mode=mode,
+                query_engines=index_data["query_engines"],
+                collections=index_data["collections"]
+            )
+            sessions[session_id] = session
+        except HTTPException as e:
+            # Propagate errors from index loading
+            raise e
+        except Exception as e:
+             raise HTTPException(status_code=500, detail=f"Failed to create session and load index for {pr_id}: {str(e)}")
+
+    # --- API Key Check ---
     if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "your_openai_api_key_here":
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not found in environment variables or is set to the default value.")
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured on server.")
+
+    # --- Mode-Specific Logic ---
+    is_first_message = not session.chat_history
     
+    # Special handling for the first message in co_reviewer mode
+    if mode == "co_reviewer" and not session.initial_review_generated:
+        print(f"Mode A (co_reviewer): Generating initial review for session {session_id}")
+        # Use a predefined query or the user's first query to generate the initial summary
+        initial_query = "Generate a comprehensive initial code review summary for this PR." # Or use request.query
+        session.chat_history.append({"role": "user", "content": initial_query}) # Log the effective query
+        current_query = initial_query
+        session.initial_review_generated = True # Mark as generated
+    else:
+         # Add user query to history
+        session.chat_history.append({"role": "user", "content": user_query})
+        current_query = user_query
+
+
+    # --- RAG Query Process ---
     try:
-        # Get the collection query plan from the LLM
-        plan = get_collection_plan(request.query)
-        print(f"Query plan: {json.dumps(plan, indent=2)}")
+        # Get the collection query plan
+        plan = get_collection_plan(current_query, session.collections, session.pr_id)
+        print(f"Session {session_id} - Query plan: {json.dumps(plan, indent=2)}")
         
-        # Query each collection according to the plan
+        # Query each relevant collection
         responses = []
         for collection_name in plan["collections"]:
             response = query_collection(
+                session.query_engines,
                 collection_name,
-                request.query,
+                current_query,
                 plan["search_focus"]
             )
             if response:
                 responses.append(response)
         
         if not responses:
-            raise HTTPException(status_code=500, detail="No valid responses from any collection")
+            # Handle case where no collections provided useful info
+            # Maybe generate a response indicating no info found or ask clarifying questions
+            ai_response_content = "I couldn't retrieve specific information for your query from the available data sources."
+            final_response_data = {
+                 "answer": ai_response_content,
+                 "sources": [],
+                 "collections_used": plan["collections"] # Show which were attempted
+            }
+        else:
+             # Synthesize the responses into a coherent answer, considering history
+            final_response_data = synthesize_responses(current_query, responses, session.chat_history, session.mode)
+
+        # Add AI response to history
+        session.chat_history.append({"role": "assistant", "content": final_response_data["answer"]})
         
-        # Synthesize the responses into a coherent answer
-        final_response = synthesize_responses(request.query, responses)
-        return QueryResponse(**final_response)
+        # Keep history length manageable (e.g., last 10 messages) - Optional
+        MAX_HISTORY = 10
+        if len(session.chat_history) > MAX_HISTORY * 2: # User+Assistant pairs
+             session.chat_history = session.chat_history[-(MAX_HISTORY*2):]
+
+        return ChatResponse(
+            session_id=session_id,
+            answer=final_response_data["answer"],
+            sources=final_response_data["sources"],
+            collections_used=final_response_data["collections_used"],
+            mode=session.mode,
+            pr_id=session.pr_id
+        )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+        # Log error for debugging
+        import traceback
+        print(f"Error processing chat for session {session_id}: {str(e)}")
+        traceback.print_exc() 
+        raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Make sure reload is False if you want sessions to persist across saves in dev
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

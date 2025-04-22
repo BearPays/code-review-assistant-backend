@@ -85,6 +85,13 @@ def get_collection_plan(query: str, available_collections: List[str], pr_id: str
     """Have the LLM analyze the query and determine which collections to query."""
     # Note: Using available_collections passed from the session
     
+    print("\n" + "="*80)
+    print("COLLECTION PLANNING PHASE")
+    print("="*80)
+    print(f"User Query: {query}")
+    print(f"Available Collections: {available_collections}")
+    print(f"PR ID: {pr_id}")
+    
     system_prompt = f"""You are a Code Review Assistant with access to these specific collections for PR '{pr_id}':
 {', '.join(available_collections)}
 
@@ -123,14 +130,33 @@ Return your analysis as a JSON object with:
 - search_focus: What to look for in each collection, including specific fields to examine
 """
     
+    print("\n" + "-"*40)
+    print("SYSTEM PROMPT SENT TO GPT-4")
+    print("-"*40)
+    print(system_prompt)
+    print("\nUser Query:", query)
+    print("-"*40 + "\n")
+    
     llm = OpenAI(model="gpt-4")
     response = llm.complete(
         system_prompt + f"\n\nUser Query: {query}\n\nAnalysis:"
     )
     
+    print("\n" + "-"*40)
+    print("GPT-4 RESPONSE")
+    print("-"*40)
+    print(str(response))
+    print("-"*40 + "\n")
+    
     try:
         # Try to parse the response as JSON
         plan = json.loads(str(response))
+        
+        print("\n" + "-"*40)
+        print("PARSED PLAN")
+        print("-"*40)
+        print(json.dumps(plan, indent=2))
+        print("-"*40 + "\n")
         
         # Validate that the collections exist
         valid_collections = []
@@ -145,12 +171,24 @@ Return your analysis as a JSON object with:
             plan["collections"] = available_collections
             plan["reasoning"] = "Using all available collections as no specific ones were determined or validated"
             plan["search_focus"] = "General information"
+            print("\n" + "⚠️"*20)
+            print("NO VALID COLLECTIONS FOUND - USING ALL AVAILABLE")
+            print("⚠️"*20 + "\n")
         else:
             plan["collections"] = valid_collections
             
+        print("\n" + "-"*40)
+        print("FINAL VALIDATED PLAN")
+        print("-"*40)
+        print(json.dumps(plan, indent=2))
+        print("="*80 + "\n")
+        
         return plan
     except json.JSONDecodeError:
         # If not valid JSON, create a default plan using all available collections
+        print("\n" + "❌"*20)
+        print("JSON PARSING ERROR - USING DEFAULT PLAN")
+        print("❌"*20 + "\n")
         return {
             "collections": available_collections,
             "reasoning": "Could not parse LLM response for collection plan, using all available collections",
@@ -165,20 +203,28 @@ def query_collection(session_query_engines: Dict, collection_name: str, query: s
         return None
         
     try:
+        print(f"Querying collection '{collection_name}' with query: {query}")
+        
         # Add focus to the query for better context
         focused_query = f"""{query}
 
 Focus on: {focus}"""
         
-        # TODO: Consider making top_k dynamic or configurable if needed
-        similarity_top_k = 5 # Increased default
+        # For source code queries, add file path filtering
+        if collection_name.endswith("_source_code") and "file" in query.lower():
+            import re
+            file_path_match = re.search(r'ogen-main/.*?\.(yml|yaml|json|py|go|ts|js|java|cpp|h|hpp)', query)
+            if file_path_match:
+                file_path = file_path_match.group(0)
+                focused_query += f"\n\nSpecifically look for file: {file_path}"
+        
+        similarity_top_k = 5
         
         query_engine_info = session_query_engines[collection_name]
         query_engine = query_engine_info["engine"]
         retriever = query_engine_info["retriever"]
         retriever.similarity_top_k = similarity_top_k
         
-        print(f"Querying collection '{collection_name}' with top_k={similarity_top_k}")
         response = query_engine.query(focused_query)
         
         # Extract sources metadata
@@ -186,10 +232,11 @@ Focus on: {focus}"""
         if hasattr(response, "source_nodes"):
             for node in response.source_nodes:
                 metadata = getattr(node, "metadata", {})
-                text_preview = getattr(node, "text", "")[:100] + "..."
+                text = getattr(node, "text", "")
+                text_preview = text[:200] + "..." if len(text) > 200 else text
                 source_info = {"text_preview": text_preview}
                 if metadata:
-                    source_info.update(metadata) # Add metadata like filename if available
+                    source_info.update(metadata)
                 sources.append(source_info)
 
         return {
@@ -213,19 +260,42 @@ def synthesize_co_reviewer_response(query: str, responses: List[Dict], chat_hist
         for resp in responses if resp # Ensure response is not None
     ])
     
+    # Extract key information from responses
+    pr_info = {}
+    file_changes = []
+    
+    for resp in responses:
+        if resp and resp.get("sources"):
+            for source in resp["sources"]:
+                if "file_name" in source and source["file_name"].startswith("pr_"):
+                    # This is PR metadata
+                    try:
+                        pr_data = json.loads(source["text_preview"])
+                        if isinstance(pr_data, dict):
+                            pr_info.update(pr_data)
+                    except:
+                        pass
+                elif "file_path" in source:
+                    # This is a file change
+                    file_changes.append(source)
+    
     system_prompt = "" # Initialize
 
     # --- Select Prompt Based on Initial vs Follow-up ---
     if is_initial_review:
         # Prompt for Initial Co-Reviewer Summary
         system_prompt = """You are a Code Review Assistant generating an initial review summary.
-Your task is to create a structured code review summary based *only* on the provided context.
+Your task is to create a structured code review summary based on the provided context.
 
 Available Information (Extracted from PR data, code, requirements):
 {formatted_responses}
 
+Additional Context:
+PR Metadata: {pr_metadata}
+File Changes: {file_changes}
+
 Instructions:
-1.  **Extract key details** (like PR number, title, author, status) **directly from the 'Available Information' section.**
+1.  **Extract key details** (like PR number, title, author, status) from the PR Metadata section.
 2.  Generate a structured multi-aspect code review summary using this Markdown format:
     ```markdown
     ## Initial Code Review Summary: PR {{pr_number}} - {{pr_title}}
@@ -234,18 +304,18 @@ Instructions:
     **Status:** {{extracted_status}}
 
     **1. Overview:**
-    [Briefly summarize the PR's purpose based *only* on the description found in the available information.]
+    [Briefly summarize the PR's purpose based on the description found in the available information.]
 
     **2. Key Changes:**
-    [Summarize the main file changes and the nature of diffs based *only* on the provided 'Available Information'. Mention key added/modified files.]
+    [Summarize the main file changes and the nature of diffs based on the File Changes section. Mention key added/modified files.]
 
     **3. Potential Areas for Focus:**
-    [Based *only* on the provided info, suggest 1-2 general areas the user might want to look closer at, e.g., specific complex files, security aspects if mentioned, or major logic changes.]
+    [Based on the provided info, suggest 1-2 general areas the user might want to look closer at, e.g., specific complex files, security aspects if mentioned, or major logic changes.]
 
     **4. Next Steps:**
     Please ask follow-up questions about specific files, logic, or concerns.
     ```
-3.  **If the 'Available Information' seems insufficient to fill the template, state that clearly instead of refusing.** Example: "I have retrieved some initial information, but crucial details like [missing detail] were not found in the available context. Here's what I could gather: [Provide partial summary]." Fill the template fields with "[Data not available]" if specific data points are missing.
+3.  **If certain information is missing, state that clearly instead of refusing.** Example: "I have retrieved some initial information, but crucial details like [missing detail] were not found in the available context. Here's what I could gather: [Provide partial summary]." Fill the template fields with "[Data not available]" if specific data points are missing.
 
 Initial Review Summary:"""
 
@@ -259,12 +329,17 @@ Chat History:
 Available New Information (Extracted for the latest query):
 {formatted_responses}
 
+Additional Context:
+PR Metadata: {pr_metadata}
+File Changes: {file_changes}
+
 User Query: {query}
 
 Instructions:
 1.  Analyze the User Query in the context of the Chat History.
-2.  Use the Available New Information section to answer the query, supplementing with history context if needed.
-3.  Provide a clear, conversational response directly addressing the query.
+2.  Use the Available New Information and Additional Context sections to answer the query.
+3.  If the query is about a specific file, check the File Changes section first.
+4.  Provide a clear, conversational response directly addressing the query.
 
 Assistant Response:"""
 
@@ -274,10 +349,12 @@ Assistant Response:"""
     try:
         final_response = llm.complete(
             system_prompt.format(
-                mode=mode, # Although mode is fixed to co_reviewer here, keep for consistency if prompt uses it
+                mode=mode,
                 history_str=history_str if chat_history else "No history yet.",
                 formatted_responses=formatted_responses if responses else "No new information gathered.",
-                query=query
+                query=query,
+                pr_metadata=json.dumps(pr_info, indent=2),
+                file_changes=json.dumps(file_changes, indent=2)
             )
         )
     except KeyError as e:

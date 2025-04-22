@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import uvicorn
@@ -9,7 +9,7 @@ from src.routers import chat
 load_dotenv()
 
 # Create FastAPI app
-app = FastAPI(title="Code Review RAG API", description="API for Code Review AI Assistant")
+app = FastAPI(title="Code Review Agent API", description="API for Code Review AI Assistant")
 
 # Add CORS middleware
 app.add_middleware(
@@ -20,13 +20,13 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Include routers
+# Include the router with no prefix to match original API
 app.include_router(chat.router)
 
 # Health check endpoint (optional, but good practice)
 @app.get("/")
 def read_root():
-    return {"message": "Code Review RAG API is running."}
+    return {"message": "Code Review Agent API is running."}
 
 
 if __name__ == "__main__":

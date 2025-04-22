@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Any
 
 # === Session Data Model ===
 class SessionData(BaseModel):
@@ -20,7 +20,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     answer: str
-    sources: list
-    collections_used: list
+    sources: List[Dict]
+    collections_used: List[str]
     mode: str
-    pr_id: str 
+    pr_id: str
+    tools_used: List[str] = []
+    metadata: Dict[str, Any] = {} 
